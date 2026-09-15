@@ -58,15 +58,15 @@ plans), `reviewer` (correctness review with a required failure case per finding)
 ## Install
 
 ```bash
-pi install git:github.com/spitgranger/pi-subagents
+pi install git:github.com/Spitgranger/pi-subagent-extension
 ```
 
 Pin a ref for reproducible installs, and add `-l` to install into the current
 project (`.pi/settings.json`) instead of your user settings:
 
 ```bash
-pi install git:github.com/spitgranger/pi-subagents@v0.1.0
-pi install git:github.com/spitgranger/pi-subagents -l
+pi install git:github.com/Spitgranger/pi-subagent-extension@v0.1.0
+pi install git:github.com/Spitgranger/pi-subagent-extension -l
 ```
 
 Other sources work too — a local checkout, or npm if you publish it:
@@ -79,11 +79,11 @@ pi install npm:pi-subagents@0.1.0
 To try it for one session without installing, use `-e`:
 
 ```bash
-pi -e git:github.com/spitgranger/pi-subagents
+pi -e git:github.com/Spitgranger/pi-subagent-extension
 ```
 
 Manage it with `pi list`, `pi update --extensions`, and `pi remove
-git:github.com/spitgranger/pi-subagents`.
+git:github.com/Spitgranger/pi-subagent-extension`.
 
 > Only one copy may be loaded at a time. If you also have a hand-placed copy in
 > `~/.pi/agent/extensions/`, remove it first — pi refuses to load the second
@@ -591,10 +591,18 @@ the one that goes missing.
 ## Development
 
 The extension is plain TypeScript with no build step — pi loads it through jiti,
-and `@earendil-works/*` imports are aliased to pi's own bundled modules at load
-time. They are declared as `peerDependencies` with a `*` range, per pi's package
-rules, and must not be bundled. There is no `node_modules` here and none is
-needed at runtime.
+and `@earendil-works/*` and `typebox` imports are aliased to pi's own bundled
+modules at load time.
+
+**The package declares no dependencies, deliberately.** pi runs `npm install` on
+a freshly cloned git package, and npm >= 7 auto-installs `peerDependencies` —
+so listing the pi core packages as peers (even with
+`peerDependenciesMeta.optional`) pulled a full **277 MB** copy of pi into every
+install. Those modules are never resolved from `node_modules` anyway, because
+the loader aliases them. pi's own example extension packages (`gondolin`,
+`sandbox`) declare none of them either.
+
+Only genuine third-party runtime dependencies belong in `dependencies` here.
 
 Work on it in place without reinstalling:
 
