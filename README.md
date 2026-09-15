@@ -16,6 +16,7 @@ normative — prefer them over guessing from behavior.
 ## Table of contents
 
 - [What this gives you](#what-this-gives-you)
+- [Install](#install)
 - [Quick start](#quick-start)
 - [Agent definitions](#agent-definitions)
 - [Tool reference](#tool-reference)
@@ -26,6 +27,7 @@ normative — prefer them over guessing from behavior.
   - [Why RPC mode and not one-shot](#why-rpc-mode-and-not-one-shot)
   - [Why an overlay and not tmux](#why-an-overlay-and-not-tmux)
   - [Architecture](#architecture)
+  - [Package layout](#package-layout)
   - [Lifecycle of one subagent](#lifecycle-of-one-subagent)
   - [How activity reaches the screen](#how-activity-reaches-the-screen)
   - [Invariants](#invariants)
@@ -53,20 +55,44 @@ plans), `reviewer` (correctness review with a required failure case per finding)
 
 ---
 
-## Quick start
+## Install
 
 ```bash
-# 1. Agent definitions live here
-ls ~/.agents/agents/          # scout.md  planner.md  reviewer.md
-
-# 2. The extension lives here and is auto-discovered (directory with an index.ts)
-ls ~/.pi/agent/extensions/subagents/
-
-# 3. Start pi normally
-pi
+pi install git:github.com/<you>/pi-subagents
 ```
 
-Then, in pi:
+Pin a ref for reproducible installs, and add `-l` to install into the current
+project (`.pi/settings.json`) instead of your user settings:
+
+```bash
+pi install git:github.com/<you>/pi-subagents@v0.1.0
+pi install git:github.com/<you>/pi-subagents -l
+```
+
+Other sources work too — a local checkout, or npm if you publish it:
+
+```bash
+pi install ~/Documents/Projects/pi-subagents      # local path, no copy
+pi install npm:pi-subagents@0.1.0
+```
+
+To try it for one session without installing, use `-e`:
+
+```bash
+pi -e git:github.com/<you>/pi-subagents
+```
+
+Manage it with `pi list`, `pi update --extensions`, and `pi remove
+git:github.com/<you>/pi-subagents`.
+
+> Only one copy may be loaded at a time. If you also have a hand-placed copy in
+> `~/.pi/agent/extensions/`, remove it first — pi refuses to load the second
+> one with `Tool "subagent_start" conflicts with ...`.
+
+## Quick start
+
+Nothing else to set up: the package ships `scout`, `planner` and `reviewer`, so
+after installing you can go straight to:
 
 ```
 use @scout to find where model selection happens
@@ -126,10 +152,17 @@ own and can match a provider you have no key for, which fails the subagent with
 
 ### Locations and precedence
 
-| Scope | Path | Loaded |
+Three sources, in increasing order of precedence:
+
+| Source | Path | Loaded |
 |---|---|---|
-| user | `~/.agents/agents/*.md` | always |
+| bundled | `agents/` inside this package | always |
+| user | `~/.agents/agents/*.md` (or `PI_AGENTS_DIR`) | always |
 | project | `<repo>/.pi/agents/*.md` | only when a call passes `agentScope: "both"` or `"project"` |
+
+Later sources override earlier ones **by name**. So the supported way to
+customize a shipped sample is to copy it into `~/.agents/agents/` and edit it
+there — your copy shadows the bundled one and survives `pi update`.
 
 Discovery walks up from the working directory to find the nearest `.pi/agents`.
 On a name collision, the project agent wins — a repo can specialize an agent you
@@ -353,14 +386,34 @@ progress and then close.
                   └─────────────────┘  └─────────────────┘
 ```
 
+### Package layout
+
+```
+pi-subagents/
+├── package.json              pi manifest: {"pi": {"extensions": ["./extensions"]}}
+├── agents/                   bundled sample agents (scout, planner, reviewer)
+└── extensions/
+    └── subagents/            ONE extension: a directory with an index.ts
+        └── *.ts              entry plus its helper modules
+```
+
+`extensions/` holds the extension in a **subdirectory**, not as loose files. pi
+loads every top-level `.ts` under `extensions/` as its own extension, so flat
+helper modules would each be loaded as a broken extension.
+
+The bundled `agents/` directory is resolved from the extension's own location
+via `import.meta.url`, so it resolves identically from a git install, an npm
+install, or a checkout run in place.
+
 | File | Lines | Responsibility |
 |---|---:|---|
-| `index.ts` | 432 | Extension entry. Registers the four tools with their renderers, the `@` provider, `/subagents` and `alt+s`, the system-prompt roster, and session lifecycle hooks. |
+| `index.ts` | 421 | Extension entry. Registers the four tools with their renderers, the `@` provider, `/subagents` and `alt+s`, the system-prompt roster, and session lifecycle hooks. |
 | `registry.ts` | 296 | The single source of truth. Owns records, the activity log, usage accounting, and the start/send/stop state machine. Notifies subscribers on every change. |
 | `rpc-child.ts` | 278 | One child process. Spawn resolution, JSONL framing, request/response correlation, turn settlement, abort and shutdown. |
 | `viewer.ts` | 204 | The full-screen overlay. Reads the registry; owns only selection and scroll position. |
-| `agents.ts` | 183 | Discovery and frontmatter parsing for `~/.agents/agents` and `.pi/agents`. |
+| `agents.ts` | 211 | Discovery and frontmatter parsing across the bundled, user and project directories. |
 | `format.ts` | 132 | Theme-aware formatting shared by the transcript renderer and the viewer. |
+| `autocomplete.ts` | 73 | `@name` provider, stacked on pi's built-in file completion. |
 
 The dependency direction is strict: `viewer` and `index` read `registry`;
 `registry` owns `rpc-child`; `format` depends on nothing but types. Nothing
@@ -454,7 +507,7 @@ Agents modifying this extension should preserve these:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `PI_AGENTS_DIR` | `~/.agents/agents` | Directory holding user agent definitions. A leading `~` is expanded. |
+| `PI_AGENTS_DIR` | `~/.agents/agents` | Directory holding your own agent definitions. A leading `~` is expanded. Does not affect the bundled samples, which always load. |
 
 Everything else is per-call (`agentScope`, `cwd`) or comes from the agent file.
 
@@ -524,8 +577,14 @@ configured for your providers, or `pi` is not resolvable for the spawn (see
 [Spawn resolution](#spawn-resolution)).
 
 **The extension does not load at all.**
-pi discovers `~/.pi/agent/extensions/<name>/index.ts` automatically. Confirm the
-path, then start pi and check for a resource diagnostic on startup.
+Run `pi list` — it prints load failures. Check the package is in settings and
+that nothing else registers the same tools.
+
+**`Tool "subagent_start" conflicts with ...`.**
+Two copies are installed. Most likely an older hand-placed copy in
+`~/.pi/agent/extensions/subagents/` alongside the installed package. Delete the
+hand-placed one; pi refuses to load the second copy, so the package's version is
+the one that goes missing.
 
 ---
 
@@ -533,7 +592,15 @@ path, then start pi and check for a resource diagnostic on startup.
 
 The extension is plain TypeScript with no build step — pi loads it through jiti,
 and `@earendil-works/*` imports are aliased to pi's own bundled modules at load
-time. There is no `node_modules` here and none is needed at runtime.
+time. They are declared as `peerDependencies` with a `*` range, per pi's package
+rules, and must not be bundled. There is no `node_modules` here and none is
+needed at runtime.
+
+Work on it in place without reinstalling:
+
+```bash
+pi -e ~/Documents/Projects/pi-subagents
+```
 
 To typecheck against pi's real declarations, point a tsconfig at a pi checkout
 with dependencies installed (`npm install --ignore-scripts`) and map the aliases:
