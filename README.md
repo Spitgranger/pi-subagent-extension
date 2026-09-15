@@ -58,15 +58,15 @@ plans), `reviewer` (correctness review with a required failure case per finding)
 ## Install
 
 ```bash
-pi install git:github.com/<you>/pi-subagents
+pi install git:github.com/spitgranger/pi-subagents
 ```
 
 Pin a ref for reproducible installs, and add `-l` to install into the current
 project (`.pi/settings.json`) instead of your user settings:
 
 ```bash
-pi install git:github.com/<you>/pi-subagents@v0.1.0
-pi install git:github.com/<you>/pi-subagents -l
+pi install git:github.com/spitgranger/pi-subagents@v0.1.0
+pi install git:github.com/spitgranger/pi-subagents -l
 ```
 
 Other sources work too — a local checkout, or npm if you publish it:
@@ -79,11 +79,11 @@ pi install npm:pi-subagents@0.1.0
 To try it for one session without installing, use `-e`:
 
 ```bash
-pi -e git:github.com/<you>/pi-subagents
+pi -e git:github.com/spitgranger/pi-subagents
 ```
 
 Manage it with `pi list`, `pi update --extensions`, and `pi remove
-git:github.com/<you>/pi-subagents`.
+git:github.com/spitgranger/pi-subagents`.
 
 > Only one copy may be loaded at a time. If you also have a hand-placed copy in
 > `~/.pi/agent/extensions/`, remove it first — pi refuses to load the second
