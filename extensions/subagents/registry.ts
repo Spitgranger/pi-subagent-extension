@@ -17,8 +17,20 @@ import { RpcChild } from "./rpc-child.ts";
 
 /** Keep the log bounded: a long-lived subagent can emit thousands of events. */
 const MAX_ACTIVITY_ITEMS = 500;
+/** Bound retained provider text independently of the number of activity items. */
+const MAX_THINKING_CHARS = 32_000;
+
+export interface ThinkingActivity {
+	at: number;
+	kind: "thinking";
+	text: string;
+	state: "streaming" | "complete" | "incomplete";
+	redacted: boolean;
+	truncated: boolean;
+}
 
 export type ActivityItem =
+	| ThinkingActivity
 	| { at: number; kind: "tool"; name: string; args: Record<string, unknown> }
 	| { at: number; kind: "text"; text: string }
 	| { at: number; kind: "status"; text: string; level: "info" | "error" };
@@ -66,6 +78,8 @@ interface Entry {
 	record: SubagentRecord;
 	child: RpcChild;
 	promptFile: string | null;
+	/** Only the current assistant message; indices are reused by subsequent messages. */
+	thinking: Map<number, ThinkingActivity>;
 }
 
 function emptyUsage(): UsageStats {
@@ -150,7 +164,7 @@ export class SubagentRegistry {
 		};
 
 		const child = new RpcChild(args, cwd);
-		const entry: Entry = { record, child, promptFile };
+		const entry: Entry = { record, child, promptFile, thinking: new Map() };
 		this.entries.set(handle, entry);
 		// Hand the caller its handle before the first turn runs, so a tool can
 		// stream this subagent's progress while it is still working.
@@ -186,6 +200,7 @@ export class SubagentRegistry {
 		const entry = this.entries.get(handle);
 		if (!entry) return;
 		await entry.child.stop();
+		this.finishThinking(entry, true);
 		if (entry.record.status !== "error") entry.record.status = "stopped";
 		this.pushActivity(entry, { at: Date.now(), kind: "status", text: "stopped", level: "info" });
 		this.cleanupPromptFile(entry);
@@ -197,6 +212,7 @@ export class SubagentRegistry {
 	}
 
 	private async runTurn(entry: Entry, message: string, signal: AbortSignal | undefined): Promise<void> {
+		this.finishThinking(entry, true);
 		entry.record.status = "running";
 		entry.record.error = undefined;
 		entry.record.lastReply = "";
@@ -214,11 +230,43 @@ export class SubagentRegistry {
 		} catch (error) {
 			this.markError(entry, error);
 		}
+		// Abort resolves before the child finishes; retain indices for its late message_end.
+		this.finishThinking(entry, true, false);
 		this.notify();
 	}
 
 	private applyEvent(entry: Entry, event: JsonAgentSessionEvent): void {
 		const record = entry.record;
+
+		if (event.type === "message_start" && event.message.role === "assistant") {
+			this.finishThinking(entry, true);
+			this.notify();
+			return;
+		}
+
+		if (event.type === "message_update") {
+			const update = event.assistantMessageEvent;
+			if (update.type === "thinking_start" || update.type === "thinking_delta" || update.type === "thinking_end") {
+				const item = this.thinkingItem(entry, update.contentIndex);
+				if (update.type === "thinking_delta" && !item.redacted) {
+					this.setThinkingText(item, update.delta, true);
+				} else if (update.type === "thinking_end") {
+					// Some pi versions include final content; delta-only transports need not.
+					if ("content" in update && typeof update.content === "string" && !item.redacted) {
+						this.setThinkingText(item, update.content);
+					}
+					item.state = "complete";
+				}
+				this.notify();
+			}
+			return;
+		}
+
+		if (event.type === "agent_settled") {
+			this.finishThinking(entry, true);
+			this.notify();
+			return;
+		}
 
 		if (event.type === "tool_execution_start") {
 			const args = (event.args ?? {}) as Record<string, unknown>;
@@ -229,6 +277,20 @@ export class SubagentRegistry {
 
 		if (event.type === "message_end") {
 			const message = event.message;
+			if (message.role === "assistant") {
+				const interrupted = message.stopReason === "aborted" || message.stopReason === "error";
+				for (const [index, part] of message.content.entries()) {
+					if (part.type !== "thinking") continue;
+					const item = this.thinkingItem(entry, index);
+					item.redacted = part.redacted === true;
+					// Never copy thinkingSignature: it is opaque provider replay data.
+					if (item.redacted || part.thinking || !interrupted) {
+						this.setThinkingText(item, item.redacted ? "" : part.thinking);
+					}
+					item.state = interrupted ? "incomplete" : "complete";
+				}
+				this.finishThinking(entry, interrupted);
+			}
 			const text = finalAssistantText(message);
 			if (text) {
 				record.lastReply = text;
@@ -255,6 +317,29 @@ export class SubagentRegistry {
 			}
 			this.notify();
 		}
+	}
+
+	private thinkingItem(entry: Entry, index: number): ThinkingActivity {
+		let item = entry.thinking.get(index);
+		if (!item) {
+			item = { at: Date.now(), kind: "thinking", text: "", state: "streaming", redacted: false, truncated: false };
+			entry.thinking.set(index, item);
+			this.pushActivity(entry, item);
+		}
+		return item;
+	}
+
+	private setThinkingText(item: ThinkingActivity, text: string, append = false): void {
+		const previous = append ? item.text : "";
+		item.truncated = (append && item.truncated) || previous.length + text.length > MAX_THINKING_CHARS;
+		item.text = previous + text.slice(0, MAX_THINKING_CHARS - previous.length);
+	}
+
+	private finishThinking(entry: Entry, interrupted: boolean, reset = true): void {
+		for (const item of entry.thinking.values()) {
+			if (item.state === "streaming") item.state = interrupted ? "incomplete" : "complete";
+		}
+		if (reset) entry.thinking.clear();
 	}
 
 	private markError(entry: Entry, error: unknown): void {
