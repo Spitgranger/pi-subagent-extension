@@ -29,6 +29,7 @@ function harness() {
 	return { registry, entry, internal, emit, update, end, thinking };
 }
 const theme = { fg: (_color: string, text: string) => text } as any;
+const tick = (ms = 80) => new Promise((resolve) => setTimeout(resolve, ms));
 
 test("delta-only streaming updates one item, notifies, and reconciles authoritative completion", () => {
 	const h = harness();
@@ -50,7 +51,24 @@ test("delta-only streaming updates one item, notifies, and reconciles authoritat
 	assert.equal(h.thinking()[0].state, "complete");
 	assert.equal(h.entry.record.lastReply, "Done");
 	assert.equal(h.entry.record.usage.turns, 1);
-	assert.equal(notifications, 6);
+	// Boundaries notify immediately; the pending delta notification is folded into them.
+	assert.ok(notifications >= 3);
+});
+
+test("per-token deltas are coalesced and name the subagent that changed", async () => {
+	const h = harness();
+	const seen: Array<string | undefined> = [];
+	h.registry.subscribe((handle) => seen.push(handle));
+	for (let i = 0; i < 100; i++) h.update("thinking_delta", 0, { delta: "x" });
+	assert.equal(seen.length, 0);
+	await tick();
+	assert.deepEqual(seen, ["test#1"]);
+	assert.equal(h.thinking()[0].text.length, 100);
+	// An immediate notification absorbs a pending delta instead of repeating it.
+	h.update("thinking_delta", 0, { delta: "y" });
+	h.update("thinking_end", 0, { content: "done" });
+	await tick();
+	assert.deepEqual(seen, ["test#1", "test#1"]);
 });
 
 test("completion-only output and multiple indices/messages/children remain separate", () => {
@@ -105,6 +123,59 @@ test("abort preserves partial text and late message_end reconciles the same item
 	);
 });
 
+test("a late aborted message_end after the next turn starts does not duplicate blocks", async () => {
+	const h = harness();
+	h.entry.child.runTurn = async () => {
+		h.update("thinking_delta", 0, { delta: "cut off" });
+		throw new Error("Subagent turn aborted");
+	};
+	await h.internal.runTurn(h.entry, "task", undefined);
+	h.entry.child.runTurn = async () => {
+		// The aborted run's final events land after the follow-up was sent.
+		h.end([{ type: "thinking", thinking: "cut off" }], "aborted");
+		h.emit({ type: "agent_settled" });
+		h.emit({ type: "message_start", message: { role: "assistant" } });
+		h.update("thinking_delta", 0, { delta: "new" });
+		h.end([{ type: "thinking", thinking: "new" }]);
+	};
+	await h.internal.runTurn(h.entry, "again", undefined);
+	assert.deepEqual(
+		h.thinking().map((item) => [item.text, item.state]),
+		[
+			["cut off", "incomplete"],
+			["new", "complete"],
+		],
+	);
+});
+
+test("blocks that finished before an interruption stay complete", () => {
+	const h = harness();
+	h.update("thinking_delta", 0, { delta: "whole thought" });
+	h.update("thinking_end", 0, { content: "whole thought" });
+	h.update("thinking_delta", 2, { delta: "half" });
+	h.end(
+		[
+			{ type: "thinking", thinking: "whole thought" },
+			{ type: "text", text: "" },
+			{ type: "thinking", thinking: "half" },
+		],
+		"aborted",
+	);
+	assert.deepEqual(
+		h.thinking().map((item) => item.state),
+		["complete", "incomplete"],
+	);
+});
+
+test("a block closed by thinking_end during an abort is still incomplete", () => {
+	const h = harness();
+	h.update("thinking_delta", 0, { delta: "We need answer" });
+	// Seen live on openrouter: the provider closes the open block when the stream aborts.
+	h.update("thinking_end", 0, { content: "We need answer" });
+	h.end([{ type: "thinking", thinking: "We need answer" }], "aborted");
+	assert.equal(h.thinking()[0].state, "incomplete");
+});
+
 test("settlement or a new message marks abandoned blocks incomplete", () => {
 	for (const boundary of [{ type: "agent_settled" }, { type: "message_start", message: { role: "assistant" } }]) {
 		const h = harness();
@@ -139,6 +210,10 @@ test("retained text and collapsed previews are bounded; final snapshots can corr
 	h.end([{ type: "thinking", thinking: "corrected" }]);
 	assert.equal(h.thinking()[0].truncated, false);
 	assert.equal(formatActivityItem(h.thinking()[0], theme, 0), "Thinking: corrected");
+	// A cut that lands inside a surrogate pair drops the orphaned half.
+	h.end([{ type: "thinking", thinking: `${"x".repeat(31_999)}😀` }]);
+	assert.equal(h.thinking()[1].text, "x".repeat(31_999));
+	assert.equal(h.thinking()[1].truncated, true);
 });
 
 test("activity remains capped across long conversations, including thinking-disabled replies", () => {

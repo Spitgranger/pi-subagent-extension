@@ -19,6 +19,8 @@ import { RpcChild } from "./rpc-child.ts";
 const MAX_ACTIVITY_ITEMS = 500;
 /** Bound retained provider text independently of the number of activity items. */
 const MAX_THINKING_CHARS = 32_000;
+/** Reasoning deltas arrive per token; coalesce their re-renders to this interval. */
+const DELTA_NOTIFY_MS = 50;
 
 export interface ThinkingActivity {
 	at: number;
@@ -97,11 +99,17 @@ function finalAssistantText(message: AgentMessage): string | null {
 
 export class SubagentRegistry {
 	private entries = new Map<string, Entry>();
-	private listeners: Array<() => void> = [];
+	private listeners: Array<(handle: string | undefined) => void> = [];
 	private counter = 0;
+	/** Handles with a coalesced delta notification still pending. */
+	private pendingDeltas = new Set<string>();
+	private deltaTimer: ReturnType<typeof setTimeout> | undefined;
 
-	/** Notified on every state change so the viewer can re-render live. */
-	subscribe(listener: () => void): () => void {
+	/**
+	 * Notified on every state change so the viewer can re-render live. The
+	 * argument names the subagent that changed, when there is exactly one.
+	 */
+	subscribe(listener: (handle: string | undefined) => void): () => void {
 		this.listeners.push(listener);
 		return () => {
 			const index = this.listeners.indexOf(listener);
@@ -176,11 +184,11 @@ export class SubagentRegistry {
 			child.start();
 		} catch (error) {
 			this.markError(entry, error);
-			this.notify();
+			this.notify(entry.record.handle);
 			return record;
 		}
 
-		this.notify();
+		this.notify(entry.record.handle);
 		await this.runTurn(entry, task, signal);
 		return record;
 	}
@@ -204,7 +212,7 @@ export class SubagentRegistry {
 		if (entry.record.status !== "error") entry.record.status = "stopped";
 		this.pushActivity(entry, { at: Date.now(), kind: "status", text: "stopped", level: "info" });
 		this.cleanupPromptFile(entry);
-		this.notify();
+		this.notify(entry.record.handle);
 	}
 
 	async stopAll(): Promise<void> {
@@ -212,12 +220,13 @@ export class SubagentRegistry {
 	}
 
 	private async runTurn(entry: Entry, message: string, signal: AbortSignal | undefined): Promise<void> {
-		this.finishThinking(entry, true);
+		// Keep indices: an aborted previous turn's message_end may still arrive.
+		this.finishThinking(entry, true, false);
 		entry.record.status = "running";
 		entry.record.error = undefined;
 		entry.record.lastReply = "";
 		this.pushActivity(entry, { at: Date.now(), kind: "status", text: `task: ${message}`, level: "info" });
-		this.notify();
+		this.notify(entry.record.handle);
 
 		try {
 			await entry.child.runTurn(message, signal);
@@ -232,7 +241,7 @@ export class SubagentRegistry {
 		}
 		// Abort resolves before the child finishes; retain indices for its late message_end.
 		this.finishThinking(entry, true, false);
-		this.notify();
+		this.notify(entry.record.handle);
 	}
 
 	private applyEvent(entry: Entry, event: JsonAgentSessionEvent): void {
@@ -240,7 +249,7 @@ export class SubagentRegistry {
 
 		if (event.type === "message_start" && event.message.role === "assistant") {
 			this.finishThinking(entry, true);
-			this.notify();
+			this.notify(entry.record.handle);
 			return;
 		}
 
@@ -257,21 +266,23 @@ export class SubagentRegistry {
 					}
 					item.state = "complete";
 				}
-				this.notify();
+				// Deltas are per token; everything else re-renders immediately.
+				if (update.type === "thinking_delta") this.notifyDelta(entry.record.handle);
+				else this.notify(entry.record.handle);
 			}
 			return;
 		}
 
 		if (event.type === "agent_settled") {
 			this.finishThinking(entry, true);
-			this.notify();
+			this.notify(entry.record.handle);
 			return;
 		}
 
 		if (event.type === "tool_execution_start") {
 			const args = (event.args ?? {}) as Record<string, unknown>;
 			this.pushActivity(entry, { at: Date.now(), kind: "tool", name: event.toolName, args });
-			this.notify();
+			this.notify(entry.record.handle);
 			return;
 		}
 
@@ -287,7 +298,9 @@ export class SubagentRegistry {
 					if (item.redacted || part.thinking || !interrupted) {
 						this.setThinkingText(item, item.redacted ? "" : part.thinking);
 					}
-					item.state = interrupted ? "incomplete" : "complete";
+					// Providers close open blocks with thinking_end on abort, so that is no proof of
+					// completion. A block the model moved past was finished; the last one was cut off.
+					item.state = !interrupted || index < message.content.length - 1 ? "complete" : "incomplete";
 				}
 				this.finishThinking(entry, interrupted);
 			}
@@ -315,7 +328,7 @@ export class SubagentRegistry {
 					this.pushActivity(entry, { at: Date.now(), kind: "status", text: message.errorMessage, level: "error" });
 				}
 			}
-			this.notify();
+			this.notify(entry.record.handle);
 		}
 	}
 
@@ -332,7 +345,10 @@ export class SubagentRegistry {
 	private setThinkingText(item: ThinkingActivity, text: string, append = false): void {
 		const previous = append ? item.text : "";
 		item.truncated = (append && item.truncated) || previous.length + text.length > MAX_THINKING_CHARS;
-		item.text = previous + text.slice(0, MAX_THINKING_CHARS - previous.length);
+		let next = previous + text.slice(0, MAX_THINKING_CHARS - previous.length);
+		// Do not leave half of a surrogate pair at the cut.
+		if (item.truncated && /[\uD800-\uDBFF]$/.test(next)) next = next.slice(0, -1);
+		item.text = next;
 	}
 
 	private finishThinking(entry: Entry, interrupted: boolean, reset = true): void {
@@ -367,8 +383,27 @@ export class SubagentRegistry {
 		}
 	}
 
-	private notify(): void {
-		for (const listener of [...this.listeners]) listener();
+	/** Notify now. A pending coalesced delta for the same subagent is folded in. */
+	private notify(handle?: string): void {
+		if (handle === undefined) this.pendingDeltas.clear();
+		else this.pendingDeltas.delete(handle);
+		if (this.pendingDeltas.size === 0 && this.deltaTimer) {
+			clearTimeout(this.deltaTimer);
+			this.deltaTimer = undefined;
+		}
+		for (const listener of [...this.listeners]) listener(handle);
+	}
+
+	private notifyDelta(handle: string): void {
+		this.pendingDeltas.add(handle);
+		if (this.deltaTimer) return;
+		this.deltaTimer = setTimeout(() => {
+			this.deltaTimer = undefined;
+			const handles = [...this.pendingDeltas];
+			this.pendingDeltas.clear();
+			for (const pending of handles) this.notify(pending);
+		}, DELTA_NOTIFY_MS);
+		this.deltaTimer.unref?.();
 	}
 }
 

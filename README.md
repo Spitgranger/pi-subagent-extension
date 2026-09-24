@@ -486,10 +486,15 @@ The child emits pi's full session event stream as JSONL. The registry consumes:
 | `message_end` | Reconcile thinking with completed content (also supports completion-only output); append a `text` item for assistant text; accumulate usage; record `errorMessage` and flip status to `error` |
 | `agent_settled` | Mark unfinished thinking blocks incomplete and release the turn waiter |
 
-Every mutation calls `registry.notify()`, which fans out to two subscribers:
+Every mutation calls `registry.notify(handle)`, which fans out to two subscribers:
 
-1. the running tool's `onUpdate`, which repaints the inline transcript entry
+1. the running tool's `onUpdate`, which repaints the inline transcript entry —
+   only when the changed handle is its own subagent
 2. the viewer, which calls `tui.requestRender()`
+
+Reasoning deltas arrive once per token, so they are coalesced into at most one
+notification per subagent every 50 ms. Any other event notifies immediately and
+absorbs a pending delta notification.
 
 Both render from the same records through the same `format.ts` helpers, so the
 transcript view and the viewer cannot drift apart.
