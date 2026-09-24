@@ -48,6 +48,7 @@ normative — prefer them over guessing from behavior.
 | Parallel work | Several `subagent_start` calls in one assistant message; the tool is `executionMode: "parallel"` |
 | Naming an agent in a prompt | `@scout` completion in the editor, above the usual file completions |
 | Watching work happen | Inline stream in the transcript, plus a full-screen viewer on `alt+s` |
+| Subagent reasoning | Live labeled Thinking blocks inline and in the viewer, when exposed by the provider |
 | Cost visibility | Per-subagent turns, tokens, cache reads/writes, dollar cost, context size |
 
 Three sample agents ship with it: `scout` (fast recon), `planner` (implementation
@@ -307,6 +308,17 @@ and paths containing `@` are left alone.
 | `s` | stop the selected subagent |
 | `Esc` or `q` | close |
 
+Provider-exposed reasoning appears as muted **Thinking** blocks while the subagent
+works. Collapsed inline results show a short preview; expand the tool result or
+open this viewer to read the retained text. Streaming and interrupted blocks are
+labeled. Reasoning stays in activity details; the parent receives the final answer.
+
+Only reasoning text or summaries exposed by the provider are available. Models
+that do not emit thinking (including when disabled) show ordinary activity only.
+Redacted reasoning shows a placeholder, and opaque provider signatures are never
+displayed. Each block retains at most 32,000 characters with a truncation marker;
+the usual 500-item activity limit still applies.
+
 The top pane shows at most 8 subagents and scrolls the selection into view; the
 bottom pane gets the remaining terminal height, with a floor of 6 rows. While
 scrolled back, a marker shows how many lines are below; `End` returns to
@@ -464,19 +476,25 @@ Abort (`ctrl+C`) propagates: the tool's `AbortSignal` fires, the child is sent
 
 ### How activity reaches the screen
 
-The child emits pi's full session event stream as JSONL. Two event types are
-consumed:
+The child emits pi's full session event stream as JSONL. The registry consumes:
 
 | Event | Effect |
 |---|---|
 | `tool_execution_start` | Append a `tool` activity item — a tool call appears *as it starts*, not after it finishes |
-| `message_end` | Append a `text` item for assistant text; accumulate usage; record `errorMessage` and flip status to `error` |
-| `agent_settled` | Release the turn waiter |
+| `message_start` | Reset thinking-block tracking for the new assistant message |
+| `message_update` | Accumulate thinking deltas into one activity item per content index; update both displays live |
+| `message_end` | Reconcile thinking with completed content (also supports completion-only output); append a `text` item for assistant text; accumulate usage; record `errorMessage` and flip status to `error` |
+| `agent_settled` | Mark unfinished thinking blocks incomplete and release the turn waiter |
 
-Every mutation calls `registry.notify()`, which fans out to two subscribers:
+Every mutation calls `registry.notify(handle)`, which fans out to two subscribers:
 
-1. the running tool's `onUpdate`, which repaints the inline transcript entry
+1. the running tool's `onUpdate`, which repaints the inline transcript entry —
+   only when the changed handle is its own subagent
 2. the viewer, which calls `tui.requestRender()`
+
+Reasoning deltas arrive once per token, so they are coalesced into at most one
+notification per subagent every 50 ms. Any other event notifies immediately and
+absorbs a pending delta notification.
 
 Both render from the same records through the same `format.ts` helpers, so the
 transcript view and the viewer cannot drift apart.
@@ -546,7 +564,8 @@ micro-VM, plain Docker, and OpenShell patterns.
   each other. Chaining is the main agent passing one's output into another's task.
 - **The viewer is modal.** It takes keyboard focus while open; you cannot type a
   prompt and watch at the same time.
-- **Activity is capped** at the most recent 500 items per subagent.
+- **Activity is capped** at the most recent 500 items per subagent, with at most
+  32,000 characters per thinking block. Hidden reasoning cannot be retrieved.
 - **Process startup cost** is paid once per subagent, not per turn — that is the
   point of keeping children alive, but a single trivial delegation is still more
   expensive than doing the work inline.
@@ -603,6 +622,13 @@ the loader aliases them. pi's own example extension packages (`gondolin`,
 `sandbox`) declare none of them either.
 
 Only genuine third-party runtime dependencies belong in `dependencies` here.
+
+Run event-sequence and shared-renderer tests with Node 22.6 or newer, without
+installing dependencies or calling a provider:
+
+```bash
+npm test
+```
 
 Work on it in place without reinstalling:
 

@@ -171,8 +171,9 @@ export default function subagents(pi: ExtensionAPI) {
 			}
 
 			let live: SubagentRecord | undefined;
-			const unsubscribe = registry.subscribe(() => {
-				if (!live || !onUpdate) return;
+			const unsubscribe = registry.subscribe((changed) => {
+				// Other subagents' progress does not change this result.
+				if (!live || !onUpdate || (changed !== undefined && changed !== live.handle)) return;
 				onUpdate({
 					content: [{ type: "text", text: live.lastReply || `${live.handle}: ${live.status}…` }],
 					details: detailsOf([live]),
@@ -246,8 +247,8 @@ export default function subagents(pi: ExtensionAPI) {
 				throw new Error(`Unknown handle "${params.handle}". Started this session: ${handles || "none"}.`);
 			}
 
-			const unsubscribe = registry.subscribe(() => {
-				if (!onUpdate) return;
+			const unsubscribe = registry.subscribe((changed) => {
+				if (!onUpdate || (changed !== undefined && changed !== existing.handle)) return;
 				onUpdate({
 					content: [{ type: "text", text: existing.lastReply || `${existing.handle}: ${existing.status}…` }],
 					details: detailsOf([existing]),

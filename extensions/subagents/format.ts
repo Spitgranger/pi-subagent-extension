@@ -115,6 +115,18 @@ export function formatActivityItem(item: ActivityItem, theme: Theme, textLineLim
 		const color = item.level === "error" ? "error" : "muted";
 		return theme.fg(color, `· ${item.text}`);
 	}
+	if (item.kind === "thinking") {
+		const state = item.state === "complete" ? "" : ` (${item.state})`;
+		const text = item.redacted ? "[redacted by provider]" : item.text || "[no reasoning text provided]";
+		const lines = text.split("\n");
+		const shown = textLineLimit > 0 ? lines.slice(0, textLineLimit) : lines;
+		let preview = shown.join("\n");
+		// Reasoning commonly arrives as a single long line. Bound collapsed previews too.
+		if (textLineLimit > 0 && preview.length > 240) preview = `${preview.slice(0, 240)}…`;
+		const more = lines.length > shown.length ? ` … +${lines.length - shown.length} lines` : "";
+		const truncated = item.truncated ? " [truncated]" : "";
+		return theme.fg("muted", `Thinking${state}: ${preview}${more}${truncated}`);
+	}
 	const lines = item.text.split("\n");
 	const shown = textLineLimit > 0 ? lines.slice(0, textLineLimit) : lines;
 	const suffix = lines.length > shown.length ? theme.fg("muted", ` … +${lines.length - shown.length} lines`) : "";
